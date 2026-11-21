@@ -5,7 +5,7 @@ from sklearn.metrics import classification_report, f1_score, roc_auc_score
 import lightgbm as lgb
 import shap
 
-enrutamiento = "C:/Users/User/Documents/Mineria de datos/Proyecto MLOps/Anime Dataset"
+enrutamiento = "Anime Dataset"
 
 # 1. Mantener las columnas utiles para la prediccion##
 columnasValidas = ["MAL_ID","Genres","Type","Episodes","Aired","Studios","Source","Duration","Rating","Name","English name"]
