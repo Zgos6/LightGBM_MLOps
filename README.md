@@ -1,4 +1,4 @@
-Este proyecto utiliza LightGBM
+Modelo principal: LightGBM y ramdom forest
 
 Evaluacion de modelos.
 Clasification report:
