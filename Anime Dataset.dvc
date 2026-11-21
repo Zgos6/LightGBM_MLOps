@@ -1,0 +1,6 @@
+outs:
+- md5: ab99c93c05401eb1cb2fff9e36a48e4a.dir
+  size: 2870052670
+  nfiles: 42
+  hash: md5
+  path: Anime Dataset
