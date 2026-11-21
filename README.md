@@ -1,4 +1,4 @@
-Este proyecto utiliza LightGBM
+Modelo principal: LightGBM
 
 Evaluacion de modelos.
 Clasification report:
