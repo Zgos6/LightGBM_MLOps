@@ -1,2 +1,6 @@
 Anime Dataset/
 *.csv
+
+mlflow.db
+mlartifacts/
+mlruns/

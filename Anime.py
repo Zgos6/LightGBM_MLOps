@@ -1,55 +1,75 @@
+import os
+import re
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, f1_score, roc_auc_score
+from sklearn.metrics import classification_report, f1_score, roc_auc_score, accuracy_score
 import lightgbm as lgb
 import shap
+import mlflow
+import mlflow.lightgbm
+
+mlflow.set_tracking_uri("http://127.0.0.1:5000")
+mlflow.set_experiment("LightGBM_Anime")
+
+dataset_version = os.getenv("DATASET_VERSION", "v2")
+
+# Leer el hash MD5 actual registrado en DVC para trazabilidad entre versiones
+dvc_md5 = "no_encontrado"
+if os.path.exists("Anime Dataset.dvc"):
+    with open("Anime Dataset.dvc", "r", encoding="utf-8") as f:
+        match = re.search(r"md5:\s*([a-f0-9.]+)", f.read())
+        if match:
+            dvc_md5 = match.group(1)
 
 enrutamiento = "Anime Dataset"
 
-# 1. Mantener las columnas utiles para la prediccion##
+# 1. Mantener las columnas utiles para la prediccion
 columnasValidas = ["MAL_ID","Genres","Type","Episodes","Aired","Studios","Source","Duration","Rating","Name","English name"]
 
 dfAnime = pd.read_csv(
     f"{enrutamiento}/anime.csv", usecols=columnasValidas, na_values=["Unknown"]
 )
 
-# 2. Extraer año de estreno de los animes#
+# 2. Extraer año de estreno de los animes
 dfAnime["release_year"] = pd.to_numeric(dfAnime["Aired"].str.extract(r"(\d{4})")[0], errors="coerce").astype("Int32")
 
-# 3. Convertir Duration a minutos numéricos#
+# 3. Convertir Duration a minutos numéricos
 dfAnime["duration_min"] = pd.to_numeric(dfAnime["Duration"].str.extract(r"(\d+)")[0], errors="coerce").astype("Int32")
 
-# 4. Convertir Episodes a entero#
+# 4. Convertir Episodes a entero
 dfAnime["Episodes"] = pd.to_numeric(dfAnime["Episodes"], errors="coerce").astype("Int32")
 
-# 5. Simplificar el nombre de las columnas# 
+# 5. Simplificar el nombre de las columnas
 dfAnime["main_studio"] = dfAnime["Studios"].str.split(",").str[0].str.strip()
 dfAnime["main_genre"] = dfAnime["Genres"].str.split(",").str[0].str.strip()
 dfAnime["genre_count"] = (dfAnime["Genres"].str.split(",").str.len().fillna(0).astype("int8"))
 
-# 6. Eliminar columnas de texto crudo ya procesadas y estandarizar ID para el cruce#
+# 6. Eliminar columnas de texto crudo ya procesadas y estandarizar ID para el cruce
 dfAnime.drop(columns=["Aired", "Duration", "Studios", "Genres"], inplace=True)
 dfAnime.rename(columns={"MAL_ID": "anime_id"}, inplace=True)
 
-# 7. Filtrar animes con año de estreno relevantes#
+# 7. Filtrar animes con año de estreno relevantes
 dfAnime = dfAnime[dfAnime["release_year"].between(1970, 2020)]
 
-# 8. Muestrear po user_id y cruzar tablas#
-dfRatings = pd.read_csv(f"{enrutamiento}/rating_complete.csv",dtype={"user_id": "int32", "anime_id": "int32", "rating": "int8"},)
+# 8. Muestrear por user_id y cruzar tablas
+dfRatings = pd.read_csv(f"{enrutamiento}/rating_complete.csv", dtype={"user_id": "int32", "anime_id": "int32", "rating": "int8"})
 
-# 9. Seleccionar ~6.6% de usuarios#
+# 9. Seleccionar ~6.6% de usuarios
 dfRatings = dfRatings[dfRatings["user_id"] % 15 == 0]
 
-# 10. Filtrar usuarios activos#
+# 10. Filtrar usuarios activos
 conteoUsuarios = dfRatings["user_id"].value_counts()
 usuariosActivos = conteoUsuarios[conteoUsuarios >= 20].index
 dfRatings = dfRatings[dfRatings["user_id"].isin(usuariosActivos)]
 
-# 11. Unir calificaciones con los animes#
+# 11. Unir calificaciones con los animes
 dfPreparado = dfRatings.merge(dfAnime, on="anime_id", how="inner")
 
-# 12. Guardar resultado#
+# 12. Guardar resultado
 archivoSalida = f"{enrutamiento}/TablaFinalAnime.parquet"
 dfPreparado.to_parquet(archivoSalida, index=False)
 
@@ -60,7 +80,7 @@ print(f"Columnas finales: {list(dfPreparado.columns)}")
 # Crear la variable objetivo binaria (1 si rating >= 8, 0 en caso contrario)
 dfPreparado['user_like_this'] = (dfPreparado['rating'] >= 8).astype('int8')
 
-dfTrain, dfTest=train_test_split(
+dfTrain, dfTest = train_test_split(
     dfPreparado,
     test_size=0.20,
     stratify=dfPreparado['user_id'],
@@ -114,7 +134,7 @@ dfTest = dfTest.merge(genre_stats, on=['user_id', 'main_genre'], how='left')
 # Si en test aparece un género nuevo para ese usuario, respaldar con su promedio general
 dfTest['user_genre_mean'] = dfTest['user_genre_mean'].fillna(dfTest['user_mean_rating'])
 
-features=['Type','Episodes','Source','Rating','release_year','duration_min','main_studio','main_genre','genre_count','user_mean_rating','user_std_rating','user_rating_count','user_genre_mean']
+features = ['Type','Episodes','Source','Rating','release_year','duration_min','main_studio','main_genre','genre_count','user_mean_rating','user_std_rating','user_rating_count','user_genre_mean']
 target = 'user_like_this'
 
 x_train = dfTrain[features].copy()
@@ -128,66 +148,104 @@ for col in cat_cols:
     x_train[col] = x_train[col].astype('category')
     x_test[col] = x_test[col].astype('category')
 
+# ==============================================================================
+# C. ENTRENAMIENTO Y REGISTRO EN MLFLOW (Todo dentro del bloque with)
+# ==============================================================================
+with mlflow.start_run(run_name=f"lightgbm_{dataset_version}"):
+    mlflow.set_tag("dataset_version", dataset_version)
+    mlflow.set_tag("dvc_md5", dvc_md5)
 
-# 1. Entrenar el clasificador LightGBM
-modelo = lgb.LGBMClassifier(
-    n_estimators=500,
-    learning_rate=0.05,
-    num_leaves=31,
-    random_state=42,
-    n_jobs=-1
-)
+    # 1. Entrenar el clasificador LightGBM
+    modelo = lgb.LGBMClassifier(
+        n_estimators=500,
+        learning_rate=0.05,
+        num_leaves=31,
+        random_state=42,
+        n_jobs=-1
+    )
 
-modelo.fit(
-    x_train, y_train,
-    eval_set=[(x_test, y_test)],
-    callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=50)]
-)
+    mlflow.log_params({
+        "n_estimators": 500,
+        "learning_rate": 0.05,
+        "num_leaves": 31,
+        "random_state": 42,
+        "test_size": 0.20,
+        "filas_preparadas": len(dfPreparado),
+        "usuarios_unicos": int(dfPreparado['user_id'].nunique())
+    })
 
-# 2. Evaluar métricas en el 20% de prueba
-y_pred = modelo.predict(x_test)
-y_prob = modelo.predict_proba(x_test)[:, 1]
+    modelo.fit(
+        x_train, y_train,
+        eval_set=[(x_test, y_test)],
+        callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=50)]
+    )
 
-print(f"\nROC-AUC: {roc_auc_score(y_test, y_prob):.4f}")
-print(f"F1-Score: {f1_score(y_test, y_pred):.4f}")
-print("\nReporte de Clasificación:\n", classification_report(y_test, y_pred))
+    # 2. Evaluar métricas en el 20% de prueba
+    y_pred = modelo.predict(x_test)
+    y_prob = modelo.predict_proba(x_test)[:, 1]
 
-# 3. Calcular valores SHAP (sobre 10,000 filas de prueba para ejecución rápida)
-x_test_sample = x_test.sample(n=min(10_000, len(x_test)), random_state=42)
-explainer = shap.TreeExplainer(modelo)
-shap_values = explainer.shap_values(x_test_sample)
+    acc = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    auc = roc_auc_score(y_test, y_prob)
 
-# Compatibilidad entre versiones de SHAP para clasificación binaria (clase 1 = le gustó)
-if isinstance(shap_values, list):
-    shap_matrix = shap_values[1]
-elif shap_values.ndim == 3:
-    shap_matrix = shap_values[:, :, 1]
-else:
-    shap_matrix = shap_values
+    mlflow.log_metric("accuracy", acc)
+    mlflow.log_metric("f1_score", f1)
+    mlflow.log_metric("roc_auc", auc)
+    if modelo.best_iteration_:
+        mlflow.log_metric("best_iteration", modelo.best_iteration_)
 
-# 4. Responder la pregunta: Exigencia del usuario vs. Características del anime
-importancia = pd.DataFrame({
-    'variable': x_test_sample.columns,
-    'impacto_shap': np.abs(shap_matrix).mean(axis=0)
-}).sort_values('impacto_shap', ascending=False)
+    print(f"\nROC-AUC: {auc:.4f}")
+    print(f"F1-Score: {f1:.4f}")
+    print("\nReporte de Clasificación:\n", classification_report(y_test, y_pred))
 
-vars_usuario = ['user_mean_rating', 'user_std_rating', 'user_rating_count', 'user_genre_mean']
-importancia['grupo'] = np.where(
-    importancia['variable'].isin(vars_usuario),
-    'Exigencia del Usuario',
-    'Características del Anime'
-)
+    # 3. Calcular valores SHAP (sobre 10,000 filas de prueba para ejecución rápida)
+    x_test_sample = x_test.sample(n=min(10_000, len(x_test)), random_state=42)
+    explainer = shap.TreeExplainer(modelo)
+    shap_values = explainer.shap_values(x_test_sample)
 
-resumen_grupos = importancia.groupby('grupo')['impacto_shap'].sum()
-porcentaje_grupos = (resumen_grupos / resumen_grupos.sum()) * 100
+    # Compatibilidad entre versiones de SHAP para clasificación binaria (clase 1 = le gustó)
+    if isinstance(shap_values, list):
+        shap_matrix = shap_values[1]
+    elif shap_values.ndim == 3:
+        shap_matrix = shap_values[:, :, 1]
+    else:
+        shap_matrix = shap_values
 
-print("\n--- VEREDICTO: PESO RELATIVO EN LA DECISIÓN (%) ---")
-print(porcentaje_grupos.round(2))
-print("\n--- RANKING INDIVIDUAL DE VARIABLES ---")
-print(importancia.to_string(index=False))
+    # 4. Responder la pregunta: Exigencia del usuario vs. Características del anime
+    importancia = pd.DataFrame({
+        'variable': x_test_sample.columns,
+        'impacto_shap': np.abs(shap_matrix).mean(axis=0)
+    }).sort_values('impacto_shap', ascending=False)
 
-# Gráfico visual del impacto de cada variable
-shap.summary_plot(shap_matrix, x_test_sample)
+    vars_usuario = ['user_mean_rating', 'user_std_rating', 'user_rating_count', 'user_genre_mean']
+    importancia['grupo'] = np.where(
+        importancia['variable'].isin(vars_usuario),
+        'Exigencia del Usuario',
+        'Características del Anime'
+    )
+
+    resumen_grupos = importancia.groupby('grupo')['impacto_shap'].sum()
+    porcentaje_grupos = (resumen_grupos / resumen_grupos.sum()) * 100
+
+    mlflow.log_metric("peso_exigencia_usuario_pct", float(porcentaje_grupos.get('Exigencia del Usuario', 0)))
+    mlflow.log_metric("peso_caracteristicas_anime_pct", float(porcentaje_grupos.get('Características del Anime', 0)))
+
+    print("\n--- VEREDICTO: PESO RELATIVO EN LA DECISIÓN (%) ---")
+    print(porcentaje_grupos.round(2))
+    print("\n--- RANKING INDIVIDUAL DE VARIABLES ---")
+    print(importancia.to_string(index=False))
+
+    # Gráfico visual del impacto de cada variable
+    shap.summary_plot(shap_matrix, x_test_sample, show=False)
+    plt.savefig("shap_summary.png", dpi=150, bbox_inches="tight")
+    plt.close("all")
+
+    mlflow.log_artifact("shap_summary.png")
+    if os.path.exists("shap_summary.png"):
+        os.remove("shap_summary.png")
+
+    # Guardar el modelo entrenado en MLflow
+    mlflow.lightgbm.log_model(modelo, artifact_path="modelo_lightgbm")
 
 # 5. Inspeccionar predicciones con los nombres reales de los animes
 dfTest['prob_le_guste'] = y_prob
