@@ -1,0 +1,9 @@
+Anime Dataset/
+data/
+mlartifacts/
+.dvc/
+.git/
+dags/
+__pycache__/
+*.db
+*.dvc
